@@ -1,0 +1,13 @@
+services:
+  todo-app:
+    build: .
+    container_name: minimal_todo_app
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # برای محیط پروداکشن حتماً این کلید را با یک مقدار تصادفی طولانی جایگزین کنید
+      - SECRET_KEY=generate-a-strong-secret-key-here-for-production
+      - DB_PATH=/data/todos.db
+    volumes:
+      - ./todo_data:/data
