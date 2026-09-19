@@ -1,7 +1,7 @@
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import List, Optional
 
 import bcrypt
 import jwt
@@ -11,15 +11,12 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-# تنظیمات
 SECRET_KEY = os.getenv("SECRET_KEY", "your-super-secret-production-key-change-it")
 ALGORITHM = "HS256"
 DB_PATH = os.getenv("DB_PATH", "/data/todos.db")
 
-# اطمینان از وجود پوشه دیتابیس
 os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
 
-# مقداردهی اولیه دیتابیس SQLite
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
@@ -32,15 +29,39 @@ def init_db():
             );
         """)
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS todos (
+            CREATE TABLE IF NOT EXISTS categories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
-                title TEXT NOT NULL,
-                is_completed BOOLEAN DEFAULT 0,
+                name TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
             );
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS todos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                category_id INTEGER,
+                title TEXT NOT NULL,
+                tags TEXT DEFAULT '',
+                order_index INTEGER DEFAULT 0,
+                is_completed BOOLEAN DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+                FOREIGN KEY (category_id) REFERENCES categories (id) ON DELETE SET NULL
+            );
+        """)
+        
+        # بررسی و اضافه کردن ستون‌های جدید در صورت وجود دیتابیس قدیمی
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(todos);")
+        columns = [row[1] for row in cursor.fetchall()]
+        if "category_id" not in columns:
+            cursor.execute("ALTER TABLE todos ADD COLUMN category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL;")
+        if "tags" not in columns:
+            cursor.execute("ALTER TABLE todos ADD COLUMN tags TEXT DEFAULT '';")
+        if "order_index" not in columns:
+            cursor.execute("ALTER TABLE todos ADD COLUMN order_index INTEGER DEFAULT 0;")
         conn.commit()
 
 init_db()
@@ -55,19 +76,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# مدل‌های Pydantic
+# مدل‌های اعتبارسنجی
 class AuthSchema(BaseModel):
     username: str
     password: str
 
+class CategoryCreate(BaseModel):
+    name: str
+
 class TodoCreate(BaseModel):
     title: str
+    category_id: Optional[int] = None
+    tags: Optional[str] = ""
 
 class TodoUpdate(BaseModel):
-    is_completed: Optional[bool] = None
     title: Optional[str] = None
+    is_completed: Optional[bool] = None
+    category_id: Optional[int] = None
+    tags: Optional[str] = None
 
-# توابع کمکی احراز هویت
+class ReorderSchema(BaseModel):
+    ordered_ids: List[int]
+
 def get_db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -93,7 +123,7 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
     except Exception:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="توکن نامعتبر یا منقضی شده است")
 
-# --- اندپوینت‌های Auth ---
+# --- احراز هویت ---
 @app.post("/api/auth/register")
 def register(data: AuthSchema):
     username = data.username.strip().lower()
@@ -113,8 +143,7 @@ def register(data: AuthSchema):
     user_id = cursor.lastrowid
     conn.close()
     
-    token = create_token(user_id, username)
-    return {"token": token, "username": username}
+    return {"token": create_token(user_id, username), "username": username}
 
 @app.post("/api/auth/login")
 def login(data: AuthSchema):
@@ -128,15 +157,52 @@ def login(data: AuthSchema):
     if not user or not verify_password(data.password, user["password_hash"]):
         raise HTTPException(status_code=400, detail="نام کاربری یا رمز عبور اشتباه است")
     
-    token = create_token(user["id"], username)
-    return {"token": token, "username": username}
+    return {"token": create_token(user["id"], username), "username": username}
 
-# --- اندپوینت‌های Todo ---
+# --- دسته‌بندی‌ها ---
+@app.get("/api/categories")
+def get_categories(user: dict = Depends(get_current_user)):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, name FROM categories WHERE user_id = ? ORDER BY id ASC", (user["id"],))
+    categories = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return categories
+
+@app.post("/api/categories")
+def create_category(data: CategoryCreate, user: dict = Depends(get_current_user)):
+    name = data.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="نام دسته‌بندی نمی‌تواند خالی باشد")
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO categories (user_id, name) VALUES (?, ?)", (user["id"], name))
+    conn.commit()
+    cat_id = cursor.lastrowid
+    conn.close()
+    return {"id": cat_id, "name": name}
+
+@app.delete("/api/categories/{cat_id}")
+def delete_category(cat_id: int, user: dict = Depends(get_current_user)):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM categories WHERE id = ? AND user_id = ?", (cat_id, user["id"]))
+    conn.commit()
+    conn.close()
+    return {"status": "deleted"}
+
+# --- کارهای Todo ---
 @app.get("/api/todos")
 def get_todos(user: dict = Depends(get_current_user)):
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, title, is_completed, created_at FROM todos WHERE user_id = ? ORDER BY id DESC", (user["id"],))
+    cursor.execute("""
+        SELECT t.id, t.title, t.is_completed, t.category_id, t.tags, t.order_index, c.name as category_name 
+        FROM todos t
+        LEFT JOIN categories c ON t.category_id = c.id
+        WHERE t.user_id = ? 
+        ORDER BY t.order_index ASC, t.id DESC
+    """, (user["id"],))
     todos = [dict(row) for row in cursor.fetchall()]
     conn.close()
     return todos
@@ -149,11 +215,35 @@ def create_todo(data: TodoCreate, user: dict = Depends(get_current_user)):
     
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO todos (user_id, title) VALUES (?, ?)", (user["id"], title))
+    # محاسبه کمترین order_index برای قرارگیری در بالای لیست
+    cursor.execute("SELECT MIN(order_index) FROM todos WHERE user_id = ?", (user["id"],))
+    min_order = cursor.fetchone()[0]
+    new_order = (min_order - 1) if min_order is not None else 0
+
+    cursor.execute(
+        "INSERT INTO todos (user_id, title, category_id, tags, order_index) VALUES (?, ?, ?, ?, ?)",
+        (user["id"], title, data.category_id, data.tags.strip() if data.tags else "", new_order)
+    )
     conn.commit()
     todo_id = cursor.lastrowid
+    
+    category_name = None
+    if data.category_id:
+        cursor.execute("SELECT name FROM categories WHERE id = ?", (data.category_id,))
+        cat = cursor.fetchone()
+        if cat:
+            category_name = cat[0]
+
     conn.close()
-    return {"id": todo_id, "title": title, "is_completed": 0}
+    return {
+        "id": todo_id,
+        "title": title,
+        "is_completed": 0,
+        "category_id": data.category_id,
+        "category_name": category_name,
+        "tags": data.tags or "",
+        "order_index": new_order
+    }
 
 @app.patch("/api/todos/{todo_id}")
 def update_todo(todo_id: int, data: TodoUpdate, user: dict = Depends(get_current_user)):
@@ -164,14 +254,38 @@ def update_todo(todo_id: int, data: TodoUpdate, user: dict = Depends(get_current
         conn.close()
         raise HTTPException(status_code=404, detail="کار یافت نشد")
     
+    fields = []
+    values = []
     if data.is_completed is not None:
-        cursor.execute("UPDATE todos SET is_completed = ? WHERE id = ?", (1 if data.is_completed else 0, todo_id))
+        fields.append("is_completed = ?")
+        values.append(1 if data.is_completed else 0)
     if data.title is not None:
-        cursor.execute("UPDATE todos SET title = ? WHERE id = ?", (data.title.strip(), todo_id))
-    
-    conn.commit()
+        fields.append("title = ?")
+        values.append(data.title.strip())
+    if data.category_id is not None:
+        fields.append("category_id = ?")
+        values.append(data.category_id if data.category_id > 0 else None)
+    if data.tags is not None:
+        fields.append("tags = ?")
+        values.append(data.tags.strip())
+
+    if fields:
+        values.append(todo_id)
+        cursor.execute(f"UPDATE todos SET {', '.join(fields)} WHERE id = ?", tuple(values))
+        conn.commit()
+
     conn.close()
     return {"status": "success"}
+
+@app.put("/api/todos/reorder")
+def reorder_todos(data: ReorderSchema, user: dict = Depends(get_current_user)):
+    conn = get_db()
+    cursor = conn.cursor()
+    for index, todo_id in enumerate(data.ordered_ids):
+        cursor.execute("UPDATE todos SET order_index = ? WHERE id = ? AND user_id = ?", (index, todo_id, user["id"]))
+    conn.commit()
+    conn.close()
+    return {"status": "reordered"}
 
 @app.delete("/api/todos/{todo_id}")
 def delete_todo(todo_id: int, user: dict = Depends(get_current_user)):
@@ -182,7 +296,6 @@ def delete_todo(todo_id: int, user: dict = Depends(get_current_user)):
     conn.close()
     return {"status": "deleted"}
 
-# سرو فایل‌های استاتیک فرانت‌اند
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/")
